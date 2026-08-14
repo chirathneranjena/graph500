@@ -54,9 +54,10 @@ Built with **zero external or helper library dependencies** (no Thrust, no CUB),
 
 3. **GPU Delta-Stepping SSSP Solver (`sssp_delta`)**:
    - Executes lock-free double-precision 64-bit atomic distance updates (`atomicMinDouble`) on GPU.
-   - Bucketed Delta-Stepping algorithm with light edge ($\le \Delta$) inner loop and heavy edge ($> \Delta$) outer loop.
+   - Bucketed Delta-Stepping algorithm with active frontier compaction and fast pre-atomic distance checking.
    - Automatic high-degree root selection when `--root` is omitted.
-   - Distance range breakdown histogram when `--stats` is specified.
+   - **Official Graph500 SSSP Benchmark (`--graph500`)**: Randomly samples 64 valid roots ($\text{degree} \ge 1$), runs optimized SSSP across all 64 roots with pre-allocated GPU CSR memory, and outputs Min, Q1, Median, Q3, Max, Mean, StdDev, and Harmonic Mean TEPS.
+   - **Per-Root Breakdown (`--graph500 --stats`)**: Displays starting vertex IDs, root degrees, reachable vertices, traversed edges, execution time, and TEPS for each search.
 
 ### Quick Start (CUDA Engine)
 
@@ -72,11 +73,14 @@ make clean && make -j$(nproc)
 # 2. Run Single-Root GPU Beamer BFS
 ./bfs_beamer --input graph_s18.bin --stats
 
-# 3. Run Official Graph500 64-Search Benchmark
+# 3. Run Official Graph500 64-Search BFS Benchmark
 ./bfs_beamer --input graph_s18.bin --graph500 --stats
 
-# 4. Run GPU Delta-Stepping SSSP
+# 4. Run Single-Root GPU Delta-Stepping SSSP
 ./sssp_delta --input graph_s18.bin --delta 0.1 --stats
+
+# 5. Run Official Graph500 64-Search SSSP Benchmark
+./sssp_delta --input graph_s18.bin --graph500 --stats
 ```
 
 ---
@@ -107,11 +111,11 @@ python3 sssp_csr.py --input graph_s10.npz --stats --plot sssp_hist.png --validat
 
 ## 🚀 GPU Benchmark Highlights (NVIDIA GeForce RTX 5090)
 
-| Scale ($S$) | Vertices ($N$) | Total Edges ($M$) | GPU Generator Time | Generation Throughput | BFS Traversal Speed | SSSP Execution Time |
-|---|---|---|---|---|---|---|
-| **Scale 16** | $65,536$ | $2,079,468$ | $0.0355$ s | $58.62$M edges/sec | **$1.26$ GTEPS** | **$0.0712$ s** |
-| **Scale 18** | $262,144$ | $8,332,682$ | $0.1317$ s | $63.26$M edges/sec | **$2.97$ GTEPS** | **$0.3744$ s** |
-| **Scale 20** | $1,048,576$ | $33,383,025$ | $0.5080$ s | $65.71$M edges/sec | **$4.77$ GTEPS** | **$1.4281$ s** |
+| Scale ($S$) | Vertices ($N$) | Total Edges ($M$) | GPU Generator Time | Generation Throughput | BFS Traversal Speed | SSSP Single Run Time | SSSP Benchmark (64 Runs) |
+|---|---|---|---|---|---|---|---|
+| **Scale 16** | $65,536$ | $2,079,468$ | $0.0355$ s | $58.62$M edges/sec | **$1.26$ GTEPS** | **$0.0712$ s** | **$0.031$ GTEPS** |
+| **Scale 18** | $262,144$ | $8,332,682$ | $0.1317$ s | $63.26$M edges/sec | **$2.97$ GTEPS** | **$0.2728$ s** | **$0.028$ GTEPS** |
+| **Scale 20** | $1,048,576$ | $33,383,025$ | $0.5080$ s | $65.71$M edges/sec | **$4.77$ GTEPS** | **$0.9450$ s** | **$0.027$ GTEPS** |
 
 ---
 

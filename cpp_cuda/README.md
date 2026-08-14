@@ -40,7 +40,7 @@ Executes high-performance **Direction-Optimized Breadth-First Search (Beamer Alg
 - **Top-Down Kernel (`kernel_bfs_top_down`)**: Fast edge traversal for sparse frontiers.
 - **Bottom-Up Kernel (`kernel_bfs_bottom_up`)**: Early-exiting neighbor search for dense frontiers, eliminating millions of redundant edge checks on scale-free graphs.
 - **Automatic High-Degree Root Selection**: If `--root` is omitted, samples candidate vertices on GPU and picks a high-degree vertex to guarantee traversal over a large connected component.
-- **Official Graph500 64-Search Mode (`--graph500`)**: Randomly selects 64 valid starting roots ($\text{degree} \ge 1$), runs optimized GPU BFS across all 64 roots, and computes official Graph500 statistics.
+- **Official Graph500 64-Search Mode (`--graph500`)**: Randomly selects 64 valid starting roots ($\text{degree} \ge 1$), runs optimized GPU BFS across all 64 roots, and computes official Graph500 statistics. Pass `--stats` to display per-root starting vertex and TEPS breakdown.
 - **Dynamic Direction Controller**: Switches between Top-Down and Bottom-Up based on frontier edge volume ($\alpha = 14.0$) and vertex density ($\beta = 24.0$).
 
 ---
@@ -51,9 +51,10 @@ Executes high-performance **Delta-Stepping Single-Source Shortest Path (SSSP)** 
 
 ### Key SSSP Capabilities
 - **Lock-Free Atomic Distance Updates**: Uses custom double-precision 64-bit atomic minimum (`atomicMinDouble`) on GPU.
-- **Bucketed Delta-Stepping**: Light edge ($\le \Delta$) inner relaxation loop with heavy edge ($> \Delta$) outer relaxation.
+- **Bucketed Delta-Stepping**: Active frontier compaction (`kernel_update_active_frontier`) with fast non-atomic distance guards before atomic updates.
 - **Auto Root Selection**: Picks a highly-connected root vertex if `--root` is omitted.
-- **Distance Breakdown Histogram (`--stats`)**: Computes minimum, average, and maximum shortest path distances and prints a distance range histogram.
+- **Official Graph500 64-Search SSSP Mode (`--graph500`)**: Randomly samples 64 valid starting roots ($\text{degree} \ge 1$), runs GPU Delta-Stepping SSSP across all 64 roots with pre-allocated GPU CSR memory, and computes Graph500 TEPS statistics (Minimum, Q1, Median, Q3, Maximum, Mean, StdDev, Harmonic Mean).
+- **Per-Root TEPS Breakdown (`--graph500 --stats`)**: Lists each starting vertex ID, root degree, reachable vertices, traversed edges, time, raw TEPS, and GTEPS.
 
 ---
 
@@ -81,20 +82,25 @@ make clean && make -j$(nproc)
 
 ### 3. Run Official Graph500 64-Search BFS Benchmark
 ```bash
-./bfs_beamer --input graph_s20.bin --graph500
+./bfs_beamer --input graph_s20.bin --graph500 --stats
 ```
 
-### 4. Run GPU Delta-Stepping SSSP
+### 4. Run Single GPU Delta-Stepping SSSP
 ```bash
 ./sssp_delta --input graph_s20.bin --delta 0.1 --stats
+```
+
+### 5. Run Official Graph500 64-Search SSSP Benchmark
+```bash
+./sssp_delta --input graph_s20.bin --graph500 --stats
 ```
 
 ---
 
 ## Benchmark Performance (RTX 5090 GPU)
 
-| Scale ($S$) | Vertices ($N$) | Total Edges ($M$) | Generator Time | Generator Throughput | BFS Traversal Speed | SSSP Execution Time |
-|---|---|---|---|---|---|---|
-| **Scale 16** | $65,536$ | $2,079,468$ | $0.0355$ s | $58.62$M edges/sec | **$1.26$ GTEPS** | **$0.0712$ s** |
-| **Scale 18** | $262,144$ | $8,332,682$ | $0.1317$ s | $63.26$M edges/sec | **$2.97$ GTEPS** | **$0.3744$ s** |
-| **Scale 20** | $1,048,576$ | $33,383,025$ | $0.5080$ s | $65.71$M edges/sec | **$4.77$ GTEPS** | **$1.4281$ s** |
+| Scale ($S$) | Vertices ($N$) | Total Edges ($M$) | Generator Time | Generator Throughput | BFS Traversal Speed | SSSP Execution Time | SSSP Benchmark (64 Runs) |
+|---|---|---|---|---|---|---|---|
+| **Scale 16** | $65,536$ | $2,079,468$ | $0.0355$ s | $58.62$M edges/sec | **$1.26$ GTEPS** | **$0.0712$ s** | **$0.031$ GTEPS** |
+| **Scale 18** | $262,144$ | $8,332,682$ | $0.1317$ s | $63.26$M edges/sec | **$2.97$ GTEPS** | **$0.2728$ s** | **$0.028$ GTEPS** |
+| **Scale 20** | $1,048,576$ | $33,383,025$ | $0.5080$ s | $65.71$M edges/sec | **$4.77$ GTEPS** | **$0.9450$ s** | **$0.027$ GTEPS** |

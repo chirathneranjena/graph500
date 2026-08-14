@@ -36,6 +36,22 @@ struct GraphCSRData {
     std::vector<double> h_data;
 };
 
+struct Graph500SSSPBenchmarkStats {
+    int num_searches;
+    std::vector<uint64_t> selected_roots;
+    std::vector<SSSPStats> search_results;
+    std::vector<double> teps_values;
+    
+    double min_teps;
+    double q1_teps;
+    double median_teps;
+    double q3_teps;
+    double max_teps;
+    double mean_teps;
+    double stddev_teps;
+    double harmonic_mean_teps;
+};
+
 // Function Declarations
 bool load_graph_binary(const std::string& filepath, GraphCSRData& graph);
 
@@ -44,6 +60,13 @@ SSSPStats run_delta_stepping_sssp_gpu(
     int64_t requested_root = -1,
     double delta = 0.1,
     bool show_stats = false
+);
+
+Graph500SSSPBenchmarkStats run_graph500_sssp_benchmark_gpu(
+    const GraphCSRData& graph,
+    int num_searches = 64,
+    double delta = 0.1,
+    uint64_t seed = 42
 );
 
 #endif // SSSP_DELTA_CUH

@@ -197,47 +197,35 @@ static int64_t auto_select_root_gpu(const GraphCSRData& graph) {
     return (int64_t)best_root;
 }
 
-// Main Delta-Stepping GPU Driver
-SSSPStats run_delta_stepping_sssp_gpu(
+// Internal core SSSP solver using pre-allocated GPU CSR arrays
+static SSSPStats run_delta_stepping_sssp_gpu_internal(
     const GraphCSRData& graph,
-    int64_t requested_root,
+    const uint64_t* d_indptr,
+    const uint64_t* d_indices,
+    const double* d_data,
+    int64_t root,
     double delta,
     bool show_stats
 ) {
     SSSPStats stats;
     stats.total_vertices = graph.num_vertices;
     stats.total_edges = graph.num_edges;
-
-    int64_t root = requested_root;
-    if (root < 0 || (uint64_t)root >= graph.num_vertices) {
-        root = auto_select_root_gpu(graph);
-    }
-
     stats.root_vertex = root;
     stats.root_degree = graph.h_indptr[root + 1] - graph.h_indptr[root];
 
     uint64_t N = graph.num_vertices;
-    uint64_t M = graph.num_edges;
 
-    // 1. Allocate GPU arrays
-    uint64_t *d_indptr, *d_indices, *d_frontier;
-    double *d_data, *d_dist;
+    // Allocate GPU auxiliary buffers
+    double* d_dist;
+    uint64_t* d_frontier;
     int *d_flag, *d_frontier_count;
-    double *d_global_min;
+    double* d_global_min;
 
-    CUDA_CHECK(cudaMalloc(&d_indptr, (N + 1) * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_indices, M * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_data, M * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_dist, N * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_frontier, N * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_flag, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_frontier_count, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_global_min, sizeof(double)));
-
-    // 2. Transfer graph structure to GPU VRAM
-    CUDA_CHECK(cudaMemcpy(d_indptr, graph.h_indptr.data(), (N + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_indices, graph.h_indices.data(), M * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_data, graph.h_data.data(), M * sizeof(double), cudaMemcpyHostToDevice));
 
     // Initialize distances with INFINITY
     std::vector<double> h_dist(N, std::numeric_limits<double>::infinity());
@@ -340,7 +328,7 @@ SSSPStats run_delta_stepping_sssp_gpu(
     stats.total_time_sec = elapsed_ms / 1000.0;
     stats.total_bucket_steps = step_count;
 
-    // 3. Transfer final distance array back to host for statistics
+    // Transfer final distance array back to host for statistics
     CUDA_CHECK(cudaMemcpy(h_dist.data(), d_dist, N * sizeof(double), cudaMemcpyDeviceToHost));
 
     uint64_t reachable = 0;
@@ -386,9 +374,6 @@ SSSPStats run_delta_stepping_sssp_gpu(
     }
 
     // Cleanup GPU Memory
-    CUDA_CHECK(cudaFree(d_indptr));
-    CUDA_CHECK(cudaFree(d_indices));
-    CUDA_CHECK(cudaFree(d_data));
     CUDA_CHECK(cudaFree(d_dist));
     CUDA_CHECK(cudaFree(d_frontier));
     CUDA_CHECK(cudaFree(d_flag));
@@ -398,4 +383,150 @@ SSSPStats run_delta_stepping_sssp_gpu(
     CUDA_CHECK(cudaEventDestroy(stop));
 
     return stats;
+}
+
+// Main Delta-Stepping GPU Driver (Single Search Entry Point)
+SSSPStats run_delta_stepping_sssp_gpu(
+    const GraphCSRData& graph,
+    int64_t requested_root,
+    double delta,
+    bool show_stats
+) {
+    int64_t root = requested_root;
+    if (root < 0 || (uint64_t)root >= graph.num_vertices) {
+        root = auto_select_root_gpu(graph);
+    }
+
+    uint64_t N = graph.num_vertices;
+    uint64_t M = graph.num_edges;
+
+    // Allocate GPU arrays for graph CSR
+    uint64_t *d_indptr, *d_indices;
+    double *d_data;
+
+    CUDA_CHECK(cudaMalloc(&d_indptr, (N + 1) * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_indices, M * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_data, M * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(d_indptr, graph.h_indptr.data(), (N + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_indices, graph.h_indices.data(), M * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_data, graph.h_data.data(), M * sizeof(double), cudaMemcpyHostToDevice));
+
+    SSSPStats stats = run_delta_stepping_sssp_gpu_internal(
+        graph, d_indptr, d_indices, d_data, root, delta, show_stats
+    );
+
+    CUDA_CHECK(cudaFree(d_indptr));
+    CUDA_CHECK(cudaFree(d_indices));
+    CUDA_CHECK(cudaFree(d_data));
+
+    return stats;
+}
+
+// Graph500 SSSP 64-Search Benchmark Routine
+Graph500SSSPBenchmarkStats run_graph500_sssp_benchmark_gpu(
+    const GraphCSRData& graph,
+    int num_searches,
+    double delta,
+    uint64_t seed
+) {
+    Graph500SSSPBenchmarkStats bench_stats;
+    bench_stats.num_searches = num_searches;
+
+    uint64_t N = graph.num_vertices;
+    uint64_t M = graph.num_edges;
+
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<uint64_t> dist(0, N - 1);
+
+    std::vector<uint64_t> selected_roots;
+    selected_roots.reserve(num_searches);
+
+    // 1. Sample 64 distinct root vertices with degree >= 1
+    while ((int)selected_roots.size() < num_searches) {
+        uint64_t candidate = dist(rng);
+        uint64_t deg = graph.h_indptr[candidate + 1] - graph.h_indptr[candidate];
+        if (deg >= 1) {
+            bool duplicate = false;
+            for (uint64_t existing : selected_roots) {
+                if (existing == candidate) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                selected_roots.push_back(candidate);
+            }
+        }
+    }
+
+    bench_stats.selected_roots = selected_roots;
+
+    // 2. Pre-allocate and transfer GPU Graph CSR arrays ONCE for all 64 SSSP runs
+    uint64_t *d_indptr, *d_indices;
+    double *d_data;
+
+    CUDA_CHECK(cudaMalloc(&d_indptr, (N + 1) * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_indices, M * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_data, M * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(d_indptr, graph.h_indptr.data(), (N + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_indices, graph.h_indices.data(), M * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_data, graph.h_data.data(), M * sizeof(double), cudaMemcpyHostToDevice));
+
+    // 3. Execute SSSP on all 64 roots
+    bench_stats.search_results.reserve(num_searches);
+    bench_stats.teps_values.reserve(num_searches);
+
+    std::cout << "[Graph500 SSSP] Executing " << num_searches << " SSSP runs on GPU..." << std::flush;
+
+    for (int i = 0; i < num_searches; ++i) {
+        SSSPStats single_stats = run_delta_stepping_sssp_gpu_internal(
+            graph, d_indptr, d_indices, d_data, (int64_t)selected_roots[i], delta, false
+        );
+        bench_stats.search_results.push_back(single_stats);
+        bench_stats.teps_values.push_back(single_stats.teps);
+        if ((i + 1) % 16 == 0 || i == num_searches - 1) {
+            std::cout << " " << (i + 1) << "/" << num_searches << std::flush;
+        }
+    }
+    std::cout << " Done.\n";
+
+    CUDA_CHECK(cudaFree(d_indptr));
+    CUDA_CHECK(cudaFree(d_indices));
+    CUDA_CHECK(cudaFree(d_data));
+
+    // 4. Compute Graph500 SSSP Benchmark Statistics
+    std::vector<double> sorted_teps = bench_stats.teps_values;
+    std::sort(sorted_teps.begin(), sorted_teps.end());
+
+    int n = num_searches;
+    bench_stats.min_teps = sorted_teps[0];
+    bench_stats.max_teps = sorted_teps[n - 1];
+    
+    // Percentiles
+    bench_stats.q1_teps = sorted_teps[(int)(0.25 * (n - 1))];
+    bench_stats.median_teps = (n % 2 == 0) ? 0.5 * (sorted_teps[n / 2 - 1] + sorted_teps[n / 2]) : sorted_teps[n / 2];
+    bench_stats.q3_teps = sorted_teps[(int)(0.75 * (n - 1))];
+
+    // Arithmetic Mean & StdDev
+    double sum = 0.0;
+    double inv_sum = 0.0;
+    for (double teps : sorted_teps) {
+        sum += teps;
+        inv_sum += (teps > 0.0) ? (1.0 / teps) : 0.0;
+    }
+    bench_stats.mean_teps = sum / n;
+
+    double variance_sum = 0.0;
+    for (double teps : sorted_teps) {
+        double diff = teps - bench_stats.mean_teps;
+        variance_sum += diff * diff;
+    }
+    bench_stats.stddev_teps = std::sqrt(variance_sum / n);
+
+    // Harmonic Mean
+    bench_stats.harmonic_mean_teps = (inv_sum > 0.0) ? ((double)n / inv_sum) : 0.0;
+
+    return bench_stats;
 }
