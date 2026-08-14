@@ -36,19 +36,19 @@ __device__ inline uint64_t scramble_device(uint64_t v, int scale, uint64_t seed)
     return (val ^ (val >> scale)) & m;
 }
 
-// 1. Initial Edge Sampling Kernel
-__global__ void kernel_generate_stochastic_kronecker(
-    uint64_t num_edges,
+// 1. Memory-Optimized Fused Kernel: Generate Edges + Filter Self-Loops + Symmetrize + Pack 64-bit Keys
+__global__ void kernel_generate_and_symmetrize_kronecker(
+    uint64_t num_edges_initial,
     int scale,
     float a, float ab, float abc,
     uint64_t seed,
     bool scramble,
-    uint64_t* d_u,
-    uint64_t* d_v,
-    double* d_w
+    uint64_t* __restrict__ d_keys_out,
+    double* __restrict__ d_w_out,
+    uint64_t* __restrict__ d_out_count
 ) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_edges) return;
+    if (idx >= num_edges_initial) return;
 
     curandStatePhilox4_32_10_t state;
     curand_init(seed, idx, 0, &state);
@@ -79,28 +79,7 @@ __global__ void kernel_generate_stochastic_kronecker(
         v = scramble_device(v, scale, seed);
     }
 
-    double weight = (double)curand_uniform(&state);
-
-    d_u[idx] = u;
-    d_v[idx] = v;
-    d_w[idx] = weight;
-}
-
-// 2. FUSED KERNEL 1: Filter Self-Loops + Symmetrize + Pack Keys
-__global__ void kernel_fused_filter_symmetrize_pack(
-    uint64_t num_edges,
-    int scale,
-    const uint64_t* d_u_in,
-    const uint64_t* d_v_in,
-    const double* d_w_in,
-    uint64_t* d_keys_out,
-    uint64_t* d_u_out,
-    uint64_t* d_v_out,
-    double* d_w_out,
-    uint64_t* d_out_count
-) {
-    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    bool is_valid = (idx < num_edges) && (d_u_in[idx] != d_v_in[idx]);
+    bool is_valid = (u != v);
 
     unsigned int active = __ballot_sync(0xFFFFFFFF, is_valid);
     int lane = threadIdx.x & 31;
@@ -130,31 +109,25 @@ __global__ void kernel_fused_filter_symmetrize_pack(
         uint64_t pos_fwd = global_block_base + warp_bases[warp_id] + warp_item_offset;
         uint64_t pos_rev = pos_fwd + 1;
 
-        uint64_t u = d_u_in[idx];
-        uint64_t v = d_v_in[idx];
-        double w   = d_w_in[idx];
+        double weight = (double)curand_uniform(&state);
 
-        uint64_t key_fwd = (u << scale) | v;
-        uint64_t key_rev = (v << scale) | u;
+        uint64_t key_fwd = (scale <= 32) ? (((uint64_t)u << 32) | (uint64_t)v) : (((uint64_t)u << scale) | (uint64_t)v);
+        uint64_t key_rev = (scale <= 32) ? (((uint64_t)v << 32) | (uint64_t)u) : (((uint64_t)v << scale) | (uint64_t)u);
 
         d_keys_out[pos_fwd] = key_fwd;
-        d_u_out[pos_fwd]    = u;
-        d_v_out[pos_fwd]    = v;
-        d_w_out[pos_fwd]    = w;
+        d_w_out[pos_fwd]    = weight;
 
         d_keys_out[pos_rev] = key_rev;
-        d_u_out[pos_rev]    = v;
-        d_v_out[pos_rev]    = u;
-        d_w_out[pos_rev]    = w;
+        d_w_out[pos_rev]    = weight;
     }
 }
 
-// 3. Pure CUDA GPU Radix Sort - Count Pass
+// 2. Pure CUDA GPU Radix Sort - Count Pass
 __global__ void kernel_radix_count(
     uint64_t num_elements,
     int shift,
-    const uint64_t* d_keys_in,
-    uint32_t* d_block_counts,
+    const uint64_t* __restrict__ d_keys_in,
+    uint32_t* __restrict__ d_block_counts,
     uint32_t num_blocks
 ) {
     __shared__ uint32_t smem_counts[RADIX_BINS];
@@ -179,19 +152,15 @@ __global__ void kernel_radix_count(
     }
 }
 
-// 4. Pure CUDA GPU Radix Sort - Scatter Pass
+// 3. Pure CUDA GPU Radix Sort - Scatter Pass (Compact 2-Array Scatter)
 __global__ void kernel_radix_scatter(
     uint64_t num_elements,
     int shift,
-    const uint64_t* d_keys_in,
-    const uint64_t* d_u_in,
-    const uint64_t* d_v_in,
-    const double* d_w_in,
-    uint64_t* d_keys_out,
-    uint64_t* d_u_out,
-    uint64_t* d_v_out,
-    double* d_w_out,
-    const uint32_t* d_block_offsets,
+    const uint64_t* __restrict__ d_keys_in,
+    const double* __restrict__ d_w_in,
+    uint64_t* __restrict__ d_keys_out,
+    double* __restrict__ d_w_out,
+    const uint32_t* __restrict__ d_block_offsets,
     uint32_t num_blocks
 ) {
     __shared__ uint32_t smem_global_base[RADIX_BINS];
@@ -208,8 +177,6 @@ __global__ void kernel_radix_scatter(
     if (idx >= num_elements) return;
 
     uint64_t key = d_keys_in[idx];
-    uint64_t u_val = d_u_in[idx];
-    uint64_t v_val = d_v_in[idx];
     double w_val   = d_w_in[idx];
 
     uint32_t digit = (key >> shift) & 0xFFULL;
@@ -220,23 +187,19 @@ __global__ void kernel_radix_scatter(
     uint32_t global_dest = smem_global_base[digit] + rank_in_block;
 
     d_keys_out[global_dest] = key;
-    d_u_out[global_dest] = u_val;
-    d_v_out[global_dest] = v_val;
     d_w_out[global_dest] = w_val;
 }
 
-// 5. FUSED KERNEL 2: Deduplicate (Min-Weight) + CSR Degree Histogram
+// 4. FUSED KERNEL 2: Deduplicate (Min-Weight) + Direct CSR Indices & Degree Histogram
 __global__ void kernel_fused_collapse_and_csr_histogram(
     uint64_t num_edges,
-    const uint64_t* d_keys,
-    const uint64_t* d_u_in,
-    const uint64_t* d_v_in,
-    const double* d_w_in,
-    uint64_t* d_u_out,
-    uint64_t* d_v_out,
-    double* d_w_out,
-    uint64_t* d_indptr,
-    uint64_t* d_out_count
+    int scale,
+    const uint64_t* __restrict__ d_keys,
+    const double* __restrict__ d_w_in,
+    uint64_t* __restrict__ d_indices_out,
+    double* __restrict__ d_w_out,
+    uint64_t* __restrict__ d_indptr,
+    uint64_t* __restrict__ d_out_count
 ) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     bool is_unique_head = (idx < num_edges) && ((idx == 0) || (d_keys[idx] != d_keys[idx - 1]));
@@ -280,24 +243,23 @@ __global__ void kernel_fused_collapse_and_csr_histogram(
 
     if (is_unique_head) {
         uint64_t write_pos = global_block_base + warp_bases[warp_id] + warp_offset;
-        uint64_t u = d_u_in[idx];
-        uint64_t v = d_v_in[idx];
+        uint64_t key = d_keys[idx];
 
-        d_u_out[write_pos] = u;
-        d_v_out[write_pos] = v;
-        d_w_out[write_pos] = min_weight;
+        uint64_t u = (scale <= 32) ? (key >> 32) : (key >> scale);
+        uint64_t v = (scale <= 32) ? (key & 0xFFFFFFFFULL) : (key & ((1ULL << scale) - 1));
+
+        d_indices_out[write_pos] = v;
+        d_w_out[write_pos]       = min_weight;
 
         // Simultaneously increment CSR row degree histogram
         atomicAdd((unsigned long long*)&d_indptr[u + 1], 1ULL);
     }
 }
 
-// Helper: Pure CUDA GPU Radix Sort Launcher
+// Helper: Pure CUDA GPU Radix Sort Launcher (2-Array Compact Radix Sort)
 void gpu_radix_sort_64(
     uint64_t num_elements,
     uint64_t*& d_keys,
-    uint64_t*& d_u,
-    uint64_t*& d_v,
     double*& d_w
 ) {
     if (num_elements == 0) return;
@@ -305,13 +267,11 @@ void gpu_radix_sort_64(
     uint32_t block_size = 256;
     uint32_t num_blocks = (uint32_t)((num_elements + block_size - 1) / block_size);
 
-    uint64_t *d_keys_tmp, *d_u_tmp, *d_v_tmp;
+    uint64_t *d_keys_tmp;
     double *d_w_tmp;
     uint32_t *d_block_counts, *d_block_offsets;
 
     CUDA_CHECK(cudaMalloc(&d_keys_tmp, num_elements * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_u_tmp, num_elements * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_v_tmp, num_elements * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_w_tmp, num_elements * sizeof(double)));
 
     size_t count_matrix_size = (size_t)RADIX_BINS * num_blocks;
@@ -322,13 +282,9 @@ void gpu_radix_sort_64(
     std::vector<uint32_t> h_offsets(count_matrix_size);
 
     uint64_t* p_keys_in = d_keys;
-    uint64_t* p_u_in = d_u;
-    uint64_t* p_v_in = d_v;
     double* p_w_in = d_w;
 
     uint64_t* p_keys_out = d_keys_tmp;
-    uint64_t* p_u_out = d_u_tmp;
-    uint64_t* p_v_out = d_v_tmp;
     double* p_w_out = d_w_tmp;
 
     for (int shift = 0; shift < 64; shift += 8) {
@@ -354,35 +310,29 @@ void gpu_radix_sort_64(
 
         kernel_radix_scatter<<<num_blocks, block_size>>>(
             num_elements, shift,
-            p_keys_in, p_u_in, p_v_in, p_w_in,
-            p_keys_out, p_u_out, p_v_out, p_w_out,
+            p_keys_in, p_w_in,
+            p_keys_out, p_w_out,
             d_block_offsets, num_blocks
         );
         CUDA_CHECK(cudaDeviceSynchronize());
 
         std::swap(p_keys_in, p_keys_out);
-        std::swap(p_u_in, p_u_out);
-        std::swap(p_v_in, p_v_out);
         std::swap(p_w_in, p_w_out);
     }
 
     if (p_keys_in != d_keys) {
         CUDA_CHECK(cudaMemcpy(d_keys, p_keys_in, num_elements * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(d_u, p_u_in, num_elements * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
-        CUDA_CHECK(cudaMemcpy(d_v, p_v_in, num_elements * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(d_w, p_w_in, num_elements * sizeof(double), cudaMemcpyDeviceToDevice));
     }
 
     CUDA_CHECK(cudaFree(d_keys_tmp));
-    CUDA_CHECK(cudaFree(d_u_tmp));
-    CUDA_CHECK(cudaFree(d_v_tmp));
     CUDA_CHECK(cudaFree(d_w_tmp));
     CUDA_CHECK(cudaFree(d_block_counts));
     CUDA_CHECK(cudaFree(d_block_offsets));
 }
 
 // -------------------------------------------------------------
-// Main Generator Entrypoint (Fused CUDA Pipeline)
+// Main Generator Entrypoint (Memory-Optimized Fused CUDA Pipeline)
 // -------------------------------------------------------------
 
 CSRGraphGPU generate_kronecker_gpu(
@@ -414,80 +364,59 @@ CSRGraphGPU generate_kronecker_gpu(
     float ab = a + b;
     float abc = a + b + c;
 
-    uint64_t *d_u_gen, *d_v_gen;
-    double *d_w_gen;
-
-    CUDA_CHECK(cudaMalloc(&d_u_gen, num_edges_initial * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_v_gen, num_edges_initial * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_w_gen, num_edges_initial * sizeof(double)));
-
     uint32_t block_size = 256;
     uint32_t grid_size = (uint32_t)((num_edges_initial + block_size - 1) / block_size);
 
-    std::cout << "\n[1/3] Generating Kronecker graph edges on GPU..." << std::flush;
+    std::cout << "\n[1/3] Generating & Symmetrizing Kronecker graph edges on GPU..." << std::flush;
 
-    // 1. Initial Edge Sampling Kernel (UNTOUCHED)
-    kernel_generate_stochastic_kronecker<<<grid_size, block_size>>>(
-        num_edges_initial, scale, a, ab, abc, seed, scramble, d_u_gen, d_v_gen, d_w_gen
+    // Allocate buffers directly for Symmetrized & Packed Key Arrays (Max 2 * num_edges_initial)
+    uint64_t max_sym_edges = num_edges_initial * 2;
+    uint64_t *d_keys_sym, *d_sym_count;
+    double *d_w_sym;
+
+    CUDA_CHECK(cudaMalloc(&d_keys_sym, max_sym_edges * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_w_sym, max_sym_edges * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_sym_count, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(d_sym_count, 0, sizeof(uint64_t)));
+
+    // FUSED KERNEL 1: Sample Edges + Filter Self-Loops + Symmetrize + Pack 64-bit Keys in 1 Pass!
+    kernel_generate_and_symmetrize_kronecker<<<grid_size, block_size>>>(
+        num_edges_initial, scale, a, ab, abc, seed, scramble,
+        d_keys_sym, d_w_sym, d_sym_count
     );
     CUDA_CHECK(cudaEventRecord(ev_gen));
     CUDA_CHECK(cudaDeviceSynchronize());
     std::cout << " Done.\n";
 
+    uint64_t num_sym_edges = 0;
+    CUDA_CHECK(cudaMemcpy(&num_sym_edges, d_sym_count, sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_sym_count));
+
     // -------------------------------------------------------------
     // FUSED POST-PROCESSING PIPELINE
     // -------------------------------------------------------------
 
-    std::cout << "[2/3] Post-processing graph on GPU (Filtering, Symmetrizing, Radix Sort, Deduplication, CSR)..." << std::flush;
-
-    // Allocate buffers for Symmetrized & Packed Key Arrays (Max 2 * num_edges_initial)
-    uint64_t max_sym_edges = num_edges_initial * 2;
-    uint64_t *d_keys_sym, *d_u_sym, *d_v_sym, *d_sym_count;
-    double *d_w_sym;
-
-    CUDA_CHECK(cudaMalloc(&d_keys_sym, max_sym_edges * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_u_sym, max_sym_edges * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_v_sym, max_sym_edges * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_w_sym, max_sym_edges * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_sym_count, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemset(d_sym_count, 0, sizeof(uint64_t)));
-
-    // FUSED KERNEL 1: Filter Self-Loops + Symmetrize + Pack Keys in 1 Pass!
-    kernel_fused_filter_symmetrize_pack<<<grid_size, block_size>>>(
-        num_edges_initial, scale, d_u_gen, d_v_gen, d_w_gen,
-        d_keys_sym, d_u_sym, d_v_sym, d_w_sym, d_sym_count
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    uint64_t num_sym_edges = 0;
-    CUDA_CHECK(cudaMemcpy(&num_sym_edges, d_sym_count, sizeof(uint64_t), cudaMemcpyDeviceToHost));
-
-    // Free initial raw generation arrays
-    CUDA_CHECK(cudaFree(d_u_gen));
-    CUDA_CHECK(cudaFree(d_v_gen));
-    CUDA_CHECK(cudaFree(d_w_gen));
-    CUDA_CHECK(cudaFree(d_sym_count));
+    std::cout << "[2/3] Post-processing graph on GPU (Radix Sort, Deduplication, CSR Construction)..." << std::flush;
 
     // Sort Packed Keys
-    gpu_radix_sort_64(num_sym_edges, d_keys_sym, d_u_sym, d_v_sym, d_w_sym);
+    gpu_radix_sort_64(num_sym_edges, d_keys_sym, d_w_sym);
 
     // Allocate Destination Arrays for Unique Edges + CSR indptr
-    uint64_t *d_u_final, *d_v_final, *d_indptr, *d_final_count;
+    uint64_t *d_indices_final, *d_indptr, *d_final_count;
     double *d_w_final;
 
-    CUDA_CHECK(cudaMalloc(&d_u_final, num_sym_edges * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_v_final, num_sym_edges * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_indices_final, num_sym_edges * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_w_final, num_sym_edges * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_indptr, (num_vertices + 1) * sizeof(uint64_t)));
     CUDA_CHECK(cudaMemset(d_indptr, 0, (num_vertices + 1) * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_final_count, sizeof(uint64_t)));
     CUDA_CHECK(cudaMemset(d_final_count, 0, sizeof(uint64_t)));
 
-    // FUSED KERNEL 2: Deduplicate (Min-Weight) + CSR Row Histogram in 1 Pass!
+    // FUSED KERNEL 2: Deduplicate (Min-Weight) + Direct CSR Indices & Row Histogram in 1 Pass!
     uint32_t sort_grid = (uint32_t)((num_sym_edges + block_size - 1) / block_size);
     kernel_fused_collapse_and_csr_histogram<<<sort_grid, block_size>>>(
-        num_sym_edges, d_keys_sym, d_u_sym, d_v_sym, d_w_sym,
-        d_u_final, d_v_final, d_w_final, d_indptr, d_final_count
+        num_sym_edges, scale, d_keys_sym, d_w_sym,
+        d_indices_final, d_w_final, d_indptr, d_final_count
     );
 
     CUDA_CHECK(cudaEventRecord(ev_post));
@@ -502,6 +431,11 @@ CSRGraphGPU generate_kronecker_gpu(
     uint64_t current_edges = 0;
     CUDA_CHECK(cudaMemcpy(&current_edges, d_final_count, sizeof(uint64_t), cudaMemcpyDeviceToHost));
 
+    // Free Input Sorted Keys BEFORE Transferring CSR to Host
+    CUDA_CHECK(cudaFree(d_keys_sym));
+    CUDA_CHECK(cudaFree(d_w_sym));
+    CUDA_CHECK(cudaFree(d_final_count));
+
     std::cout << "[3/3] Transferring CSR graph data from GPU to Host memory..." << std::flush;
 
     // Copy CSR arrays to Host
@@ -514,7 +448,7 @@ CSRGraphGPU generate_kronecker_gpu(
 
     CUDA_CHECK(cudaMemcpy(result.h_indptr.data(), d_indptr, (num_vertices + 1) * sizeof(uint64_t), cudaMemcpyDeviceToHost));
     
-    // Compute Exclusive Prefix Sum on Host
+    // Compute Exclusive Prefix Sum on Host for CSR indptr
     uint64_t accum = 0;
     for (size_t i = 0; i <= num_vertices; ++i) {
         uint64_t count = result.h_indptr[i];
@@ -523,21 +457,15 @@ CSRGraphGPU generate_kronecker_gpu(
     }
 
     if (current_edges > 0) {
-        CUDA_CHECK(cudaMemcpy(result.h_indices.data(), d_v_final, current_edges * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(result.h_indices.data(), d_indices_final, current_edges * sizeof(uint64_t), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(result.h_data.data(), d_w_final, current_edges * sizeof(double), cudaMemcpyDeviceToHost));
     }
 
     std::cout << " Done.\n\n";
 
-    CUDA_CHECK(cudaFree(d_keys_sym));
-    CUDA_CHECK(cudaFree(d_u_sym));
-    CUDA_CHECK(cudaFree(d_v_sym));
-    CUDA_CHECK(cudaFree(d_w_sym));
-    CUDA_CHECK(cudaFree(d_u_final));
-    CUDA_CHECK(cudaFree(d_v_final));
+    CUDA_CHECK(cudaFree(d_indices_final));
     CUDA_CHECK(cudaFree(d_w_final));
     CUDA_CHECK(cudaFree(d_indptr));
-    CUDA_CHECK(cudaFree(d_final_count));
 
     CUDA_CHECK(cudaEventDestroy(ev_start));
     CUDA_CHECK(cudaEventDestroy(ev_gen));
