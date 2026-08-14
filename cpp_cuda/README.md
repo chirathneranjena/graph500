@@ -1,6 +1,6 @@
-# C++ / Pure CUDA GPU Kronecker Graph Generator & Beamer BFS Solver
+# C++ / Pure CUDA GPU Kronecker Graph Generator, Beamer BFS & Delta-Stepping SSSP
 
-High-throughput, **100% Pure CUDA C++ GPU implementation** of the **Graph500 Kronecker / R-MAT Graph Generator** and **Direction-Optimized Beamer BFS Solver**.
+High-throughput, **100% Pure CUDA C++ GPU implementation** of the **Graph500 Kronecker / R-MAT Graph Generator**, **Direction-Optimized Beamer BFS Solver**, and **Delta-Stepping Single-Source Shortest Path (SSSP) Solver**.
 
 Built with **zero external or helper library dependencies** (no Thrust, no CUB), a **Fused 2-Stage CUDA Post-Processing Pipeline**, real-time **console stage progress indicators**, and sub-microsecond **GPU event timers (`cudaEvent_t`)**.
 
@@ -43,33 +43,23 @@ Executes high-performance **Direction-Optimized Breadth-First Search (Beamer Alg
 - **Official Graph500 64-Search Mode (`--graph500`)**: Randomly selects 64 valid starting roots ($\text{degree} \ge 1$), runs optimized GPU BFS across all 64 roots, and computes official Graph500 statistics.
 - **Dynamic Direction Controller**: Switches between Top-Down and Bottom-Up based on frontier edge volume ($\alpha = 14.0$) and vertex density ($\beta = 24.0$).
 
-### Official Graph500 Benchmark Output (`./bfs_beamer --input graph_s18.bin --graph500`)
-```text
-====================================================
-          Official Graph500 Benchmark Stats         
-====================================================
-Number of BFS Searches: 64
+---
 
-Metric                        TEPS (raw)        GTEPS          
-----------------------------------------------------
-Minimum TEPS                  4.295e+08         0.430 GTEPS
-First Quartile TEPS           1.076e+09         1.076 GTEPS
-Median TEPS                   2.221e+09         2.221 GTEPS
-Third Quartile TEPS           4.796e+09         4.796 GTEPS
-Maximum TEPS                  1.130e+10         11.299 GTEPS
-Arithmetic Mean TEPS          3.208e+09         3.208 GTEPS
-Standard Deviation of TEPS    2.833e+09         2.833 GTEPS
-Harmonic Mean TEPS            1.485e+09         1.485 GTEPS
-====================================================
-Primary Graph500 Metric (Harmonic Mean): 1.485 GTEPS
-====================================================
-```
+## 3. GPU Delta-Stepping SSSP (`sssp_delta`)
+
+Executes high-performance **Delta-Stepping Single-Source Shortest Path (SSSP)** on weighted binary CSR dumps (`.bin`).
+
+### Key SSSP Capabilities
+- **Lock-Free Atomic Distance Updates**: Uses custom double-precision 64-bit atomic minimum (`atomicMinDouble`) on GPU.
+- **Bucketed Delta-Stepping**: Light edge ($\le \Delta$) inner relaxation loop with heavy edge ($> \Delta$) outer relaxation.
+- **Auto Root Selection**: Picks a highly-connected root vertex if `--root` is omitted.
+- **Distance Breakdown Histogram (`--stats`)**: Computes minimum, average, and maximum shortest path distances and prints a distance range histogram.
 
 ---
 
 ## Compilation
 
-Build both `kronecker_cuda` and `bfs_beamer` using `nvcc` and `make`:
+Build `kronecker_cuda`, `bfs_beamer`, and `sssp_delta` using `nvcc` and `make`:
 ```bash
 cd cpp_cuda
 make clean && make -j$(nproc)
@@ -84,22 +74,27 @@ make clean && make -j$(nproc)
 ./kronecker_cuda --scale 20 --edge-factor 16 -o graph_s20.bin
 ```
 
-### 2. Run Single GPU Beamer BFS with Auto Root Selection
+### 2. Run Single GPU Beamer BFS
 ```bash
 ./bfs_beamer --input graph_s20.bin --stats
 ```
 
-### 3. Run Official Graph500 64-Search Benchmark
+### 3. Run Official Graph500 64-Search BFS Benchmark
 ```bash
 ./bfs_beamer --input graph_s20.bin --graph500
+```
+
+### 4. Run GPU Delta-Stepping SSSP
+```bash
+./sssp_delta --input graph_s20.bin --delta 0.1 --stats
 ```
 
 ---
 
 ## Benchmark Performance (RTX 5090 GPU)
 
-| Scale ($S$) | Vertices ($N$) | Total Edges ($M$) | Generator Time | Generator Throughput | BFS Traversal Time | BFS Traversal Speed |
+| Scale ($S$) | Vertices ($N$) | Total Edges ($M$) | Generator Time | Generator Throughput | BFS Traversal Speed | SSSP Execution Time |
 |---|---|---|---|---|---|---|
-| **Scale 16** | $65,536$ | $2,079,468$ | $0.0355$ s | $58.62$M edges/sec | **$0.0016$ s** | **$1.26$ GTEPS** |
-| **Scale 18** | $262,144$ | $8,332,682$ | $0.1317$ s | $63.26$M edges/sec | **$0.0028$ s** | **$2.97$ GTEPS** |
-| **Scale 20** | $1,048,576$ | $33,383,025$ | $0.5080$ s | $65.71$M edges/sec | **$0.0070$ s** | **$4.77$ GTEPS** |
+| **Scale 16** | $65,536$ | $2,079,468$ | $0.0355$ s | $58.62$M edges/sec | **$1.26$ GTEPS** | **$0.0712$ s** |
+| **Scale 18** | $262,144$ | $8,332,682$ | $0.1317$ s | $63.26$M edges/sec | **$2.97$ GTEPS** | **$0.3744$ s** |
+| **Scale 20** | $1,048,576$ | $33,383,025$ | $0.5080$ s | $65.71$M edges/sec | **$4.77$ GTEPS** | **$1.4281$ s** |

@@ -165,7 +165,7 @@ bool load_graph_binary(const std::string& filepath, GraphCSRData& graph) {
 
     CSRBinaryHeader header;
     file.read(reinterpret_cast<char*>(&header), sizeof(header));
-    if (file.gcount() < sizeof(header)) {
+    if (file.gcount() < (std::streamsize)sizeof(header)) {
         std::cerr << "Error: File truncated or corrupted header." << std::endl;
         return false;
     }
@@ -187,9 +187,11 @@ bool load_graph_binary(const std::string& filepath, GraphCSRData& graph) {
     return true;
 }
 
-// Main Beamer BFS Solver Routine
-BFSStats run_beamer_bfs_gpu(
+// Internal Beamer BFS Solver with pre-allocated GPU graph CSR pointers
+static BFSStats run_beamer_bfs_gpu_internal(
     const GraphCSRData& graph,
+    const uint64_t* d_indptr,
+    const uint64_t* d_indices,
     int64_t requested_root,
     float alpha,
     float beta,
@@ -237,9 +239,7 @@ BFSStats run_beamer_bfs_gpu(
                   << " (Degree: " << stats.root_degree << ")" << std::endl;
     }
 
-    // 2. GPU Memory Allocations
-    uint64_t* d_indptr = nullptr;
-    uint64_t* d_indices = nullptr;
+    // 2. GPU Auxiliary Memory Allocations
     int32_t* d_depth = nullptr;
     uint64_t* d_frontier = nullptr;
     uint64_t* d_next_frontier = nullptr;
@@ -251,8 +251,6 @@ BFSStats run_beamer_bfs_gpu(
 
     uint64_t bitmap_words = (N + 31) / 32;
 
-    CUDA_CHECK(cudaMalloc(&d_indptr, (N + 1) * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_indices, M * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_depth, N * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&d_frontier, N * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_next_frontier, N * sizeof(uint64_t)));
@@ -261,10 +259,6 @@ BFSStats run_beamer_bfs_gpu(
     CUDA_CHECK(cudaMalloc(&d_frontier_bitmap, bitmap_words * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_next_frontier_bitmap, bitmap_words * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_edge_volume, sizeof(unsigned long long)));
-
-    // Copy graph to GPU
-    CUDA_CHECK(cudaMemcpy(d_indptr, graph.h_indptr.data(), (N + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_indices, graph.h_indices.data(), M * sizeof(uint64_t), cudaMemcpyHostToDevice));
 
     // Initialize depth array (-1 for unvisited)
     CUDA_CHECK(cudaMemset(d_depth, -1, N * sizeof(int32_t)));
@@ -404,9 +398,7 @@ BFSStats run_beamer_bfs_gpu(
     stats.traversed_edges = traversed_edges;
     stats.teps = (stats.total_time_sec > 0.0) ? (double)traversed_edges / stats.total_time_sec : 0.0;
 
-    // Free GPU allocations
-    cudaFree(d_indptr);
-    cudaFree(d_indices);
+    // Free GPU auxiliary allocations
     cudaFree(d_depth);
     cudaFree(d_frontier);
     cudaFree(d_next_frontier);
@@ -417,6 +409,38 @@ BFSStats run_beamer_bfs_gpu(
     cudaFree(d_edge_volume);
     cudaFree(d_visited_count);
     cudaFree(d_traversed_edges);
+    cudaEventDestroy(start_event);
+    cudaEventDestroy(stop_event);
+    cudaEventDestroy(level_start);
+    cudaEventDestroy(level_stop);
+
+    return stats;
+}
+
+// Public Single BFS Entry Point
+BFSStats run_beamer_bfs_gpu(
+    const GraphCSRData& graph,
+    int64_t requested_root,
+    float alpha,
+    float beta,
+    bool verbose
+) {
+    uint64_t N = graph.num_vertices;
+    uint64_t M = graph.num_edges;
+
+    uint64_t* d_indptr = nullptr;
+    uint64_t* d_indices = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_indptr, (N + 1) * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_indices, M * sizeof(uint64_t)));
+
+    CUDA_CHECK(cudaMemcpy(d_indptr, graph.h_indptr.data(), (N + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_indices, graph.h_indices.data(), M * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+    BFSStats stats = run_beamer_bfs_gpu_internal(graph, d_indptr, d_indices, requested_root, alpha, beta, verbose);
+
+    cudaFree(d_indptr);
+    cudaFree(d_indices);
 
     return stats;
 }
@@ -433,6 +457,8 @@ Graph500BenchmarkStats run_graph500_benchmark_gpu(
     bench_stats.num_searches = num_searches;
 
     uint64_t N = graph.num_vertices;
+    uint64_t M = graph.num_edges;
+
     std::mt19937_64 rng(seed);
     std::uniform_int_distribution<uint64_t> dist(0, N - 1);
 
@@ -459,14 +485,26 @@ Graph500BenchmarkStats run_graph500_benchmark_gpu(
 
     bench_stats.selected_roots = selected_roots;
 
-    // 2. Execute BFS on all 64 roots
+    // 2. Pre-allocate and transfer GPU Graph CSR arrays ONCE for all 64 runs
+    uint64_t* d_indptr = nullptr;
+    uint64_t* d_indices = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_indptr, (N + 1) * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_indices, M * sizeof(uint64_t)));
+
+    CUDA_CHECK(cudaMemcpy(d_indptr, graph.h_indptr.data(), (N + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_indices, graph.h_indices.data(), M * sizeof(uint64_t), cudaMemcpyHostToDevice));
+
+    // 3. Execute BFS on all 64 roots
     bench_stats.search_results.reserve(num_searches);
     bench_stats.teps_values.reserve(num_searches);
 
     std::cout << "[Graph500] Executing " << num_searches << " BFS runs on GPU..." << std::flush;
 
     for (int i = 0; i < num_searches; ++i) {
-        BFSStats single_stats = run_beamer_bfs_gpu(graph, (int64_t)selected_roots[i], alpha, beta, false);
+        BFSStats single_stats = run_beamer_bfs_gpu_internal(
+            graph, d_indptr, d_indices, (int64_t)selected_roots[i], alpha, beta, false
+        );
         bench_stats.search_results.push_back(single_stats);
         bench_stats.teps_values.push_back(single_stats.teps);
         if ((i + 1) % 16 == 0 || i == num_searches - 1) {
@@ -475,7 +513,10 @@ Graph500BenchmarkStats run_graph500_benchmark_gpu(
     }
     std::cout << " Done.\n";
 
-    // 3. Compute Graph500 Statistics
+    cudaFree(d_indptr);
+    cudaFree(d_indices);
+
+    // 4. Compute Graph500 Statistics
     std::vector<double> sorted_teps = bench_stats.teps_values;
     std::sort(sorted_teps.begin(), sorted_teps.end());
 
@@ -509,4 +550,3 @@ Graph500BenchmarkStats run_graph500_benchmark_gpu(
 
     return bench_stats;
 }
-
