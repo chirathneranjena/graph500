@@ -122,7 +122,7 @@ __global__ void kernel_generate_and_symmetrize_kronecker(
     }
 }
 
-// 2. Pure CUDA GPU Radix Sort - Count Pass
+// 2. Pure CUDA GPU Radix Sort - Count Pass (Grid-Stride Loop)
 __global__ void kernel_radix_count(
     uint64_t num_elements,
     int shift,
@@ -152,7 +152,7 @@ __global__ void kernel_radix_count(
     }
 }
 
-// 3. Pure CUDA GPU Radix Sort - Scatter Pass (Compact 2-Array Scatter)
+// 3. Pure CUDA GPU Radix Sort - Scatter Pass (Compact 2-Array Scatter with Grid-Stride Loop)
 __global__ void kernel_radix_scatter(
     uint64_t num_elements,
     int shift,
@@ -174,20 +174,23 @@ __global__ void kernel_radix_scatter(
     __syncthreads();
 
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_elements) return;
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
 
-    uint64_t key = d_keys_in[idx];
-    double w_val   = d_w_in[idx];
+    while (idx < num_elements) {
+        uint64_t key = d_keys_in[idx];
+        double w_val   = d_w_in[idx];
 
-    uint32_t digit = (key >> shift) & 0xFFULL;
+        uint32_t digit = (key >> shift) & 0xFFULL;
 
-    uint32_t rank_in_block = atomicAdd(&smem_local_counts[digit], 1u);
-    __syncthreads();
+        uint32_t rank_in_block = atomicAdd(&smem_local_counts[digit], 1u);
 
-    uint32_t global_dest = smem_global_base[digit] + rank_in_block;
+        uint32_t global_dest = smem_global_base[digit] + rank_in_block;
 
-    d_keys_out[global_dest] = key;
-    d_w_out[global_dest] = w_val;
+        d_keys_out[global_dest] = key;
+        d_w_out[global_dest] = w_val;
+
+        idx += stride;
+    }
 }
 
 // 4. FUSED KERNEL 2: Deduplicate (Min-Weight) + Direct CSR Indices & Degree Histogram
@@ -256,7 +259,7 @@ __global__ void kernel_fused_collapse_and_csr_histogram(
     }
 }
 
-// Helper: Pure CUDA GPU Radix Sort Launcher (2-Array Compact Radix Sort)
+// Helper: Pure CUDA GPU Radix Sort Launcher (2-Array Compact Grid-Stride Radix Sort)
 void gpu_radix_sort_64(
     uint64_t num_elements,
     uint64_t*& d_keys,
@@ -265,7 +268,8 @@ void gpu_radix_sort_64(
     if (num_elements == 0) return;
 
     uint32_t block_size = 256;
-    uint32_t num_blocks = (uint32_t)((num_elements + block_size - 1) / block_size);
+    uint32_t max_blocks = 2048;
+    uint32_t num_blocks = (uint32_t)std::min((uint64_t)max_blocks, (num_elements + block_size - 1) / block_size);
 
     uint64_t *d_keys_tmp;
     double *d_w_tmp;
