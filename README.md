@@ -1,6 +1,6 @@
-# Graph500 Kronecker Graph Generator & BFS Benchmark Suite
+# Graph500 Kronecker Graph Generator, BFS & SSSP Benchmark Suite
 
-A high-performance implementation of the **Graph500 Specifications** for synthetic **Stochastic Kronecker (R-MAT) Graph Generation** and **Direction-Optimized Breadth-First Search (BFS)** graph traversal.
+A high-performance implementation of the **Graph500 Specifications** for synthetic **Stochastic Kronecker (R-MAT) Graph Generation**, **Direction-Optimized Breadth-First Search (BFS)**, and **Delta-Stepping Single-Source Shortest Path (SSSP)** graph traversals.
 
 This repository features both a **100% Pure CUDA C++ GPU Engine** (`cpp_cuda/`) optimized for extreme throughput on NVIDIA GPUs, and a **Vectorized Python / NumPy Reference Suite** (`python/`).
 
@@ -16,8 +16,11 @@ graph500/
 │   ├── kronecker_generator.cuh# CUDA Generator headers & CSR binary dump structs
 │   ├── bfs_beamer.cu          # Direction-Optimized Beamer BFS & Graph500 Benchmark
 │   ├── bfs_beamer.cuh         # CUDA BFS headers & stats data structures
+│   ├── sssp_delta.cu          # GPU Delta-Stepping Single-Source Shortest Path (SSSP)
+│   ├── sssp_delta.cuh         # CUDA SSSP headers & distance stats structs
 │   ├── main.cu                # CLI entry point for kronecker_cuda
 │   ├── main_bfs.cu            # CLI entry point for bfs_beamer
+│   ├── main_sssp.cu           # CLI entry point for sssp_delta
 │   ├── Makefile               # GPU build script
 │   └── README.md              # Detailed CUDA implementation documentation
 └── python/                    # Vectorized Python / NumPy Reference Implementation
@@ -49,6 +52,12 @@ Built with **zero external or helper library dependencies** (no Thrust, no CUB),
    - Automatic high-degree root auto-selection when `--root` is omitted.
    - **Official Graph500 Benchmark (`--graph500`)**: Randomly samples 64 valid roots ($\text{degree} \ge 1$), runs optimized BFS traversals across all 64 roots on GPU, and outputs Min, Q1, Median, Q3, Max, Mean, StdDev, and Harmonic Mean TEPS.
 
+3. **GPU Delta-Stepping SSSP Solver (`sssp_delta`)**:
+   - Executes lock-free double-precision 64-bit atomic distance updates (`atomicMinDouble`) on GPU.
+   - Bucketed Delta-Stepping algorithm with light edge ($\le \Delta$) inner loop and heavy edge ($> \Delta$) outer loop.
+   - Automatic high-degree root selection when `--root` is omitted.
+   - Distance range breakdown histogram when `--stats` is specified.
+
 ### Quick Start (CUDA Engine)
 
 ```bash
@@ -65,6 +74,9 @@ make clean && make -j$(nproc)
 
 # 3. Run Official Graph500 64-Search Benchmark
 ./bfs_beamer --input graph_s18.bin --graph500 --stats
+
+# 4. Run GPU Delta-Stepping SSSP
+./sssp_delta --input graph_s18.bin --delta 0.1 --stats
 ```
 
 ---
@@ -95,11 +107,11 @@ python3 sssp_csr.py --input graph_s10.npz --stats --plot sssp_hist.png --validat
 
 ## 🚀 GPU Benchmark Highlights (NVIDIA GeForce RTX 5090)
 
-| Scale ($S$) | Vertices ($N$) | Total Edges ($M$) | GPU Generator Time | Generation Throughput | BFS Traversal Time | BFS Traversal Speed |
+| Scale ($S$) | Vertices ($N$) | Total Edges ($M$) | GPU Generator Time | Generation Throughput | BFS Traversal Speed | SSSP Execution Time |
 |---|---|---|---|---|---|---|
-| **Scale 16** | $65,536$ | $2,079,468$ | $0.0355$ s | $58.62$M edges/sec | **$0.0016$ s** | **$1.26$ GTEPS** |
-| **Scale 18** | $262,144$ | $8,332,682$ | $0.1317$ s | $63.26$M edges/sec | **$0.0028$ s** | **$2.97$ GTEPS** |
-| **Scale 20** | $1,048,576$ | $33,383,025$ | $0.5080$ s | $65.71$M edges/sec | **$0.0070$ s** | **$4.77$ GTEPS** |
+| **Scale 16** | $65,536$ | $2,079,468$ | $0.0355$ s | $58.62$M edges/sec | **$1.26$ GTEPS** | **$0.0712$ s** |
+| **Scale 18** | $262,144$ | $8,332,682$ | $0.1317$ s | $63.26$M edges/sec | **$2.97$ GTEPS** | **$0.3744$ s** |
+| **Scale 20** | $1,048,576$ | $33,383,025$ | $0.5080$ s | $65.71$M edges/sec | **$4.77$ GTEPS** | **$1.4281$ s** |
 
 ---
 
