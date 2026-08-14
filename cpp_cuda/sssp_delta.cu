@@ -42,6 +42,30 @@ __device__ inline double atomicMinDouble(double* address, double val) {
     return __longlong_as_double(old);
 }
 
+// Warp-safe Atomic Queue Insertion Helper
+__device__ __forceinline__ void warp_insert_sssp_queue(
+    uint64_t v,
+    bool inserted,
+    uint64_t* d_next_frontier,
+    int* d_next_frontier_count
+) {
+    unsigned active = __ballot_sync(__activemask(), inserted);
+    if (inserted) {
+        int lane = threadIdx.x & 31;
+        int warp_rank = __popc(active & ((1u << lane) - 1));
+        int warp_total = __popc(active);
+
+        int leader = __ffs(active) - 1;
+        int pos = 0;
+        if (lane == leader) {
+            pos = atomicAdd(d_next_frontier_count, warp_total);
+        }
+        pos = __shfl_sync(active, pos, leader);
+
+        d_next_frontier[pos + warp_rank] = v;
+    }
+}
+
 // Binary CSR Loader
 bool load_graph_binary(const std::string& filepath, GraphCSRData& graph) {
     std::ifstream file(filepath, std::ios::binary);
@@ -89,8 +113,8 @@ bool load_graph_binary(const std::string& filepath, GraphCSRData& graph) {
     return true;
 }
 
-// CUDA Kernel: Relax edges originating from frontier vertices in the active bucket
-__global__ void kernel_sssp_relax_edges(
+// Optimized CUDA Kernel: Relax edges originating from frontier vertices in the active bucket
+__global__ void kernel_sssp_relax_edges_queue(
     const uint64_t* __restrict__ d_frontier,
     int frontier_count,
     const uint64_t* __restrict__ d_indptr,
@@ -99,7 +123,10 @@ __global__ void kernel_sssp_relax_edges(
     double* __restrict__ d_dist,
     bool relax_light,
     double delta,
-    int* __restrict__ d_changed_flag
+    double bucket_max,
+    int* __restrict__ d_changed_flag,
+    uint64_t* __restrict__ d_next_frontier,
+    int* __restrict__ d_next_frontier_count
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= frontier_count) return;
@@ -118,11 +145,15 @@ __global__ void kernel_sssp_relax_edges(
             uint64_t v = d_indices[e];
             double new_dist = du + w;
 
-            // Fast pre-check to eliminate unnecessary atomic instructions
+            // Fast pre-check before atomic call
             if (d_dist[v] > new_dist) {
                 double old_dist = atomicMinDouble(&d_dist[v], new_dist);
                 if (new_dist < old_dist) {
                     *d_changed_flag = 1;
+                    
+                    // If relaxed via light edge and falls into current bucket, push directly to next queue!
+                    bool push_queue = relax_light && (new_dist < bucket_max) && (d_next_frontier != nullptr);
+                    warp_insert_sssp_queue(v, push_queue, d_next_frontier, d_next_frontier_count);
                 }
             }
         }
@@ -138,29 +169,48 @@ __global__ void kernel_update_active_frontier(
     double bucket_max,
     int* __restrict__ d_frontier_count
 ) {
-    uint64_t u = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t u = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (u >= num_vertices) return;
 
     double du = d_dist[u];
-    if (du >= bucket_min && du < bucket_max) {
-        int pos = atomicAdd(d_frontier_count, 1);
-        d_frontier[pos] = u;
-    }
+    bool is_active = (du >= bucket_min && du < bucket_max);
+    warp_insert_sssp_queue(u, is_active, d_frontier, d_frontier_count);
 }
 
-// CUDA Kernel: Find minimum distance among remaining active vertices
-__global__ void kernel_find_min_distance(
+// CUDA Kernel: Block-Reduced Find Minimum Distance among remaining active vertices
+__global__ void kernel_find_min_distance_reduced(
     uint64_t num_vertices,
     const double* __restrict__ d_dist,
     double current_bucket_max,
     double* __restrict__ d_global_min
 ) {
-    uint64_t u = blockIdx.x * blockDim.x + threadIdx.x;
-    if (u >= num_vertices) return;
+    uint64_t u = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    
+    double thread_min = INFINITY;
+    if (u < num_vertices) {
+        double du = d_dist[u];
+        if (du >= current_bucket_max && du < INFINITY) {
+            thread_min = du;
+        }
+    }
 
-    double du = d_dist[u];
-    if (du >= current_bucket_max && du < INFINITY) {
-        atomicMinDouble(d_global_min, du);
+    // Block-level reduction
+    __shared__ double smem[256];
+    int tid = threadIdx.x;
+    smem[tid] = thread_min;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (smem[tid + s] < smem[tid]) {
+                smem[tid] = smem[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0 && smem[0] < INFINITY) {
+        atomicMinDouble(d_global_min, smem[0]);
     }
 }
 
@@ -217,20 +267,27 @@ static SSSPStats run_delta_stepping_sssp_gpu_internal(
 
     // Allocate GPU auxiliary buffers
     double* d_dist;
-    uint64_t* d_frontier;
-    int *d_flag, *d_frontier_count;
+    uint64_t *d_frontier, *d_next_frontier;
+    int *d_flag, *d_frontier_count, *d_next_frontier_count;
     double* d_global_min;
 
     CUDA_CHECK(cudaMalloc(&d_dist, N * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_frontier, N * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_next_frontier, N * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_flag, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_frontier_count, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_next_frontier_count, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_global_min, sizeof(double)));
 
     // Initialize distances with INFINITY
     std::vector<double> h_dist(N, std::numeric_limits<double>::infinity());
     h_dist[root] = 0.0;
     CUDA_CHECK(cudaMemcpy(d_dist, h_dist.data(), N * sizeof(double), cudaMemcpyHostToDevice));
+
+    // Initialize root in active frontier queue
+    CUDA_CHECK(cudaMemcpy(d_frontier, &root, sizeof(uint64_t), cudaMemcpyHostToDevice));
+    int init_active = 1;
+    CUDA_CHECK(cudaMemcpy(d_frontier_count, &init_active, sizeof(int), cudaMemcpyHostToDevice));
 
     int block_size = 256;
     int grid_size_N = (N + block_size - 1) / block_size;
@@ -248,61 +305,59 @@ static SSSPStats run_delta_stepping_sssp_gpu_internal(
     while (current_bucket_min < INFINITY) {
         step_count++;
 
-        // 1. Build compact active frontier array for current bucket range [current_bucket_min, current_bucket_max)
-        CUDA_CHECK(cudaMemset(d_frontier_count, 0, sizeof(int)));
-        kernel_update_active_frontier<<<grid_size_N, block_size>>>(
-            N, d_dist, d_frontier, current_bucket_min, current_bucket_max, d_frontier_count
-        );
-        CUDA_CHECK(cudaDeviceSynchronize());
-
         int active_count = 0;
         CUDA_CHECK(cudaMemcpy(&active_count, d_frontier_count, sizeof(int), cudaMemcpyDeviceToHost));
+
+        if (active_count == 0) {
+            // Build active frontier for bucket range [current_bucket_min, current_bucket_max)
+            CUDA_CHECK(cudaMemset(d_frontier_count, 0, sizeof(int)));
+            kernel_update_active_frontier<<<grid_size_N, block_size>>>(
+                N, d_dist, d_frontier, current_bucket_min, current_bucket_max, d_frontier_count
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(&active_count, d_frontier_count, sizeof(int), cudaMemcpyDeviceToHost));
+        }
 
         if (active_count > 0) {
             int grid_size_active = (active_count + block_size - 1) / block_size;
 
-            // 2. Inner Light Edge Relaxation Loop for active bucket vertices
-            while (true) {
+            // Inner Light Edge Relaxation Loop for active bucket vertices
+            while (active_count > 0) {
                 int changed = 0;
                 CUDA_CHECK(cudaMemset(d_flag, 0, sizeof(int)));
+                CUDA_CHECK(cudaMemset(d_next_frontier_count, 0, sizeof(int)));
 
-                kernel_sssp_relax_edges<<<grid_size_active, block_size>>>(
+                kernel_sssp_relax_edges_queue<<<grid_size_active, block_size>>>(
                     d_frontier, active_count, d_indptr, d_indices, d_data, d_dist,
-                    true, delta, d_flag
+                    true, delta, current_bucket_max, d_flag, d_next_frontier, d_next_frontier_count
                 );
                 CUDA_CHECK(cudaDeviceSynchronize());
 
                 CUDA_CHECK(cudaMemcpy(&changed, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
                 if (!changed) break;
 
-                // Re-build active frontier after light edge updates
-                CUDA_CHECK(cudaMemset(d_frontier_count, 0, sizeof(int)));
-                kernel_update_active_frontier<<<grid_size_N, block_size>>>(
-                    N, d_dist, d_frontier, current_bucket_min, current_bucket_max, d_frontier_count
-                );
-                CUDA_CHECK(cudaDeviceSynchronize());
-
-                CUDA_CHECK(cudaMemcpy(&active_count, d_frontier_count, sizeof(int), cudaMemcpyDeviceToHost));
+                // Swap queues: d_next_frontier becomes d_frontier
+                CUDA_CHECK(cudaMemcpy(&active_count, d_next_frontier_count, sizeof(int), cudaMemcpyDeviceToHost));
                 if (active_count == 0) break;
+
+                std::swap(d_frontier, d_next_frontier);
                 grid_size_active = (active_count + block_size - 1) / block_size;
             }
 
-            // 3. Heavy Edge Relaxation for active bucket vertices
-            if (active_count > 0) {
-                CUDA_CHECK(cudaMemset(d_flag, 0, sizeof(int)));
-                kernel_sssp_relax_edges<<<grid_size_active, block_size>>>(
-                    d_frontier, active_count, d_indptr, d_indices, d_data, d_dist,
-                    false, delta, d_flag
-                );
-                CUDA_CHECK(cudaDeviceSynchronize());
-            }
+            // Heavy Edge Relaxation for current bucket vertices
+            CUDA_CHECK(cudaMemset(d_flag, 0, sizeof(int)));
+            kernel_sssp_relax_edges_queue<<<grid_size_active, block_size>>>(
+                d_frontier, active_count, d_indptr, d_indices, d_data, d_dist,
+                false, delta, current_bucket_max, d_flag, nullptr, nullptr
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        // 4. Advance to next non-empty bucket range
+        // Advance to next non-empty bucket range
         double next_min = INFINITY;
         CUDA_CHECK(cudaMemcpy(d_global_min, &next_min, sizeof(double), cudaMemcpyHostToDevice));
 
-        kernel_find_min_distance<<<grid_size_N, block_size>>>(
+        kernel_find_min_distance_reduced<<<grid_size_N, block_size>>>(
             N, d_dist, current_bucket_max, d_global_min
         );
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -316,6 +371,7 @@ static SSSPStats run_delta_stepping_sssp_gpu_internal(
         // Set next bucket bounds
         current_bucket_min = std::floor(next_min / delta) * delta;
         current_bucket_max = current_bucket_min + delta;
+        CUDA_CHECK(cudaMemset(d_frontier_count, 0, sizeof(int)));
 
         if (step_count > N * 10) break; // Safety cutoff
     }
@@ -376,8 +432,10 @@ static SSSPStats run_delta_stepping_sssp_gpu_internal(
     // Cleanup GPU Memory
     CUDA_CHECK(cudaFree(d_dist));
     CUDA_CHECK(cudaFree(d_frontier));
+    CUDA_CHECK(cudaFree(d_next_frontier));
     CUDA_CHECK(cudaFree(d_flag));
     CUDA_CHECK(cudaFree(d_frontier_count));
+    CUDA_CHECK(cudaFree(d_next_frontier_count));
     CUDA_CHECK(cudaFree(d_global_min));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
@@ -462,7 +520,7 @@ Graph500SSSPBenchmarkStats run_graph500_sssp_benchmark_gpu(
 
     bench_stats.selected_roots = selected_roots;
 
-    // 2. Pre-allocate and transfer GPU Graph CSR arrays ONCE for all 64 SSSP runs
+    // 2. Pre-allocate and transfer GPU Graph CSR arrays ONCE for all 64 runs
     uint64_t *d_indptr, *d_indices;
     double *d_data;
 
@@ -496,7 +554,7 @@ Graph500SSSPBenchmarkStats run_graph500_sssp_benchmark_gpu(
     CUDA_CHECK(cudaFree(d_indices));
     CUDA_CHECK(cudaFree(d_data));
 
-    // 4. Compute Graph500 SSSP Benchmark Statistics
+    // 4. Compute Graph500 Statistics
     std::vector<double> sorted_teps = bench_stats.teps_values;
     std::sort(sorted_teps.begin(), sorted_teps.end());
 
@@ -504,7 +562,7 @@ Graph500SSSPBenchmarkStats run_graph500_sssp_benchmark_gpu(
     bench_stats.min_teps = sorted_teps[0];
     bench_stats.max_teps = sorted_teps[n - 1];
     
-    // Percentiles
+    // Percentile calculations
     bench_stats.q1_teps = sorted_teps[(int)(0.25 * (n - 1))];
     bench_stats.median_teps = (n % 2 == 0) ? 0.5 * (sorted_teps[n / 2 - 1] + sorted_teps[n / 2]) : sorted_teps[n / 2];
     bench_stats.q3_teps = sorted_teps[(int)(0.75 * (n - 1))];

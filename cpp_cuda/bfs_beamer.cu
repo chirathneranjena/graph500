@@ -17,35 +17,55 @@
         } \
     } while (0)
 
-// Clear bitmap kernel
-__global__ void kernel_clear_bitmap(uint32_t* bitmap, uint64_t size_words) {
+// -------------------------------------------------------------
+// Pure CUDA Device Helpers & Optimizations
+// -------------------------------------------------------------
+
+// Warp-safe Atomic Frontier Insertion Helper
+__device__ __forceinline__ void warp_insert_frontier(
+    uint64_t v,
+    bool discovered,
+    uint64_t* d_next_frontier,
+    uint64_t* d_next_frontier_count,
+    uint64_t* d_next_frontier_bitmap
+) {
+    unsigned active = __ballot_sync(__activemask(), discovered);
+    if (discovered) {
+        int lane = threadIdx.x & 31;
+        int warp_rank = __popc(active & ((1u << lane) - 1));
+        int warp_total = __popc(active);
+
+        int leader = __ffs(active) - 1;
+        uint64_t pos = 0;
+        if (lane == leader) {
+            pos = atomicAdd((unsigned long long*)d_next_frontier_count, (unsigned long long)warp_total);
+        }
+        pos = __shfl_sync(active, pos, leader);
+
+        d_next_frontier[pos + warp_rank] = v;
+
+        if (d_next_frontier_bitmap) {
+            uint64_t v_word = v >> 6;
+            uint64_t v_mask = 1ULL << (v & 63);
+            atomicOr((unsigned long long*)&d_next_frontier_bitmap[v_word], (unsigned long long)v_mask);
+        }
+    }
+}
+
+// 1. Clear 64-bit Bitmap Kernel
+__global__ void kernel_clear_bitmap_64(uint64_t* bitmap, uint64_t size_words) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size_words) {
-        bitmap[idx] = 0;
+        bitmap[idx] = 0ULL;
     }
 }
 
-// Convert frontier array to bitmap
-__global__ void kernel_frontier_to_bitmap(
-    const uint64_t* d_frontier,
-    uint64_t frontier_size,
-    uint32_t* d_bitmap
-) {
-    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < frontier_size) {
-        uint64_t u = d_frontier[idx];
-        uint64_t word_idx = u >> 5;
-        uint32_t bit_mask = 1U << (u & 31);
-        atomicOr(&d_bitmap[word_idx], bit_mask);
-    }
-}
-
-// Compute frontier edge volume
+// 2. Compute Frontier Edge Volume
 __global__ void kernel_count_frontier_edges(
-    const uint64_t* d_frontier,
+    const uint64_t* __restrict__ d_frontier,
     uint64_t frontier_size,
-    const uint64_t* d_indptr,
-    unsigned long long* d_edge_volume
+    const uint64_t* __restrict__ d_indptr,
+    unsigned long long* __restrict__ d_edge_volume
 ) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < frontier_size) {
@@ -55,17 +75,17 @@ __global__ void kernel_count_frontier_edges(
     }
 }
 
-// Top-Down BFS Kernel
-__global__ void kernel_bfs_top_down(
-    const uint64_t* d_indptr,
-    const uint64_t* d_indices,
-    const uint64_t* d_frontier,
+// 3. Top-Down BFS Kernel (Thread-per-Vertex)
+__global__ void kernel_bfs_top_down_thread(
+    const uint64_t* __restrict__ d_indptr,
+    const uint64_t* __restrict__ d_indices,
+    const uint64_t* __restrict__ d_frontier,
     uint64_t frontier_size,
     int32_t current_depth,
-    int32_t* d_depth,
-    uint64_t* d_next_frontier,
-    uint64_t* d_next_frontier_count,
-    uint32_t* d_next_frontier_bitmap
+    int32_t* __restrict__ d_depth,
+    uint64_t* __restrict__ d_next_frontier,
+    uint64_t* __restrict__ d_next_frontier_count,
+    uint64_t* __restrict__ d_next_frontier_bitmap
 ) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= frontier_size) return;
@@ -76,35 +96,67 @@ __global__ void kernel_bfs_top_down(
 
     for (uint64_t e = start; e < end; ++e) {
         uint64_t v = d_indices[e];
+        bool discovered = false;
         
         if (d_depth[v] == -1) {
             int32_t old = atomicCAS(&d_depth[v], -1, current_depth + 1);
             if (old == -1) {
-                // Successfully visited v
-                uint64_t pos = atomicAdd((unsigned long long*)d_next_frontier_count, 1ULL);
-                d_next_frontier[pos] = v;
-                
-                if (d_next_frontier_bitmap) {
-                    uint64_t word_idx = v >> 5;
-                    uint32_t bit_mask = 1U << (v & 31);
-                    atomicOr(&d_next_frontier_bitmap[word_idx], bit_mask);
-                }
+                discovered = true;
             }
         }
+
+        warp_insert_frontier(v, discovered, d_next_frontier, d_next_frontier_count, d_next_frontier_bitmap);
     }
 }
 
-// Bottom-Up BFS Kernel
-__global__ void kernel_bfs_bottom_up(
-    uint64_t num_vertices,
-    const uint64_t* d_indptr,
-    const uint64_t* d_indices,
-    const uint32_t* d_frontier_bitmap,
+// 4. Top-Down BFS Kernel (Warp-per-Vertex Cooperative Traversal for Hub Vertices)
+__global__ void kernel_bfs_top_down_warp(
+    const uint64_t* __restrict__ d_indptr,
+    const uint64_t* __restrict__ d_indices,
+    const uint64_t* __restrict__ d_frontier,
+    uint64_t frontier_size,
     int32_t current_depth,
-    int32_t* d_depth,
-    uint64_t* d_next_frontier,
-    uint64_t* d_next_frontier_count,
-    uint32_t* d_next_frontier_bitmap
+    int32_t* __restrict__ d_depth,
+    uint64_t* __restrict__ d_next_frontier,
+    uint64_t* __restrict__ d_next_frontier_count,
+    uint64_t* __restrict__ d_next_frontier_bitmap
+) {
+    uint64_t warp_idx = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp_idx >= frontier_size) return;
+
+    uint64_t u = d_frontier[warp_idx];
+    uint64_t start = d_indptr[u];
+    uint64_t end = d_indptr[u + 1];
+
+    int lane = threadIdx.x & 31;
+
+    // 32 threads in warp stride through adjacency list in parallel (100% coalesced memory reads)
+    for (uint64_t e = start + lane; e < end; e += 32) {
+        uint64_t v = d_indices[e];
+        bool discovered = false;
+
+        if (d_depth[v] == -1) {
+            int32_t old = atomicCAS(&d_depth[v], -1, current_depth + 1);
+            if (old == -1) {
+                discovered = true;
+            }
+        }
+
+        warp_insert_frontier(v, discovered, d_next_frontier, d_next_frontier_count, d_next_frontier_bitmap);
+    }
+}
+
+// 5. Bottom-Up BFS Kernel (Hierarchical 64-bit Bitmap Skipping)
+__global__ void kernel_bfs_bottom_up_64(
+    uint64_t num_vertices,
+    const uint64_t* __restrict__ d_indptr,
+    const uint64_t* __restrict__ d_indices,
+    const uint64_t* __restrict__ d_frontier_bitmap,
+    int32_t current_depth,
+    int32_t* __restrict__ d_depth,
+    uint64_t* __restrict__ d_next_frontier,
+    uint64_t* __restrict__ d_next_frontier_count,
+    uint64_t* __restrict__ d_next_frontier_bitmap
 ) {
     uint64_t v = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (v >= num_vertices) return;
@@ -116,34 +168,30 @@ __global__ void kernel_bfs_bottom_up(
 
     for (uint64_t e = start; e < end; ++e) {
         uint64_t u = d_indices[e];
-        uint64_t word_idx = u >> 5;
-        uint32_t bit_mask = 1U << (u & 31);
+        uint64_t word_idx = u >> 6;
+        uint64_t bit_mask = 1ULL << (u & 63);
 
-        if ((d_frontier_bitmap[word_idx] & bit_mask) != 0) {
-            // Found a parent in current frontier!
+        uint64_t word_val = d_frontier_bitmap[word_idx];
+        if (word_val == 0ULL) continue; // Fast skip: 64 vertices skipped in 1 check!
+
+        if ((word_val & bit_mask) != 0ULL) {
+            // Found parent in frontier!
             d_depth[v] = current_depth + 1;
             
-            uint64_t pos = atomicAdd((unsigned long long*)d_next_frontier_count, 1ULL);
-            d_next_frontier[pos] = v;
-
-            if (d_next_frontier_bitmap) {
-                uint64_t v_word = v >> 5;
-                uint32_t v_mask = 1U << (v & 31);
-                atomicOr(&d_next_frontier_bitmap[v_word], v_mask);
-            }
+            warp_insert_frontier(v, true, d_next_frontier, d_next_frontier_count, d_next_frontier_bitmap);
 
             break; // Early exit on first parent hit
         }
     }
 }
 
-// Count visited vertices & traversed edges
+// 6. Compute visited vertices & traversed edges
 __global__ void kernel_compute_bfs_stats(
     uint64_t num_vertices,
-    const int32_t* d_depth,
-    const uint64_t* d_indptr,
-    unsigned long long* d_visited_count,
-    unsigned long long* d_traversed_edges
+    const int32_t* __restrict__ d_depth,
+    const uint64_t* __restrict__ d_indptr,
+    unsigned long long* __restrict__ d_visited_count,
+    unsigned long long* __restrict__ d_traversed_edges
 ) {
     uint64_t v = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (v >= num_vertices) return;
@@ -214,7 +262,6 @@ static BFSStats run_beamer_bfs_gpu_internal(
     }
 
     if (requested_root < 0) {
-        // Auto-select root with highest degree from candidate sampling
         uint64_t max_deg = 0;
         uint64_t best_root = 0;
         std::mt19937_64 rng(1337);
@@ -239,25 +286,25 @@ static BFSStats run_beamer_bfs_gpu_internal(
                   << " (Degree: " << stats.root_degree << ")" << std::endl;
     }
 
-    // 2. GPU Auxiliary Memory Allocations
+    // 2. GPU Auxiliary Memory Allocations (64-bit Bitmaps)
     int32_t* d_depth = nullptr;
     uint64_t* d_frontier = nullptr;
     uint64_t* d_next_frontier = nullptr;
     uint64_t* d_frontier_count = nullptr;
     uint64_t* d_next_frontier_count = nullptr;
-    uint32_t* d_frontier_bitmap = nullptr;
-    uint32_t* d_next_frontier_bitmap = nullptr;
+    uint64_t* d_frontier_bitmap = nullptr;
+    uint64_t* d_next_frontier_bitmap = nullptr;
     unsigned long long* d_edge_volume = nullptr;
 
-    uint64_t bitmap_words = (N + 31) / 32;
+    uint64_t bitmap_words_64 = (N + 63) / 64;
 
     CUDA_CHECK(cudaMalloc(&d_depth, N * sizeof(int32_t)));
     CUDA_CHECK(cudaMalloc(&d_frontier, N * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_next_frontier, N * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_frontier_count, sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_next_frontier_count, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_frontier_bitmap, bitmap_words * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc(&d_next_frontier_bitmap, bitmap_words * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_frontier_bitmap, bitmap_words_64 * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_next_frontier_bitmap, bitmap_words_64 * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_edge_volume, sizeof(unsigned long long)));
 
     // Initialize depth array (-1 for unvisited)
@@ -271,14 +318,14 @@ static BFSStats run_beamer_bfs_gpu_internal(
     uint64_t init_frontier_size = 1;
     CUDA_CHECK(cudaMemcpy(d_frontier_count, &init_frontier_size, sizeof(uint64_t), cudaMemcpyHostToDevice));
 
-    // Clear Bitmaps
-    CUDA_CHECK(cudaMemset(d_frontier_bitmap, 0, bitmap_words * sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(d_next_frontier_bitmap, 0, bitmap_words * sizeof(uint32_t)));
+    // Clear 64-bit Bitmaps
+    CUDA_CHECK(cudaMemset(d_frontier_bitmap, 0, bitmap_words_64 * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemset(d_next_frontier_bitmap, 0, bitmap_words_64 * sizeof(uint64_t)));
 
-    // Set bit for root in frontier bitmap
-    uint32_t root_bit = 1U << (root & 31);
-    uint64_t root_word = root >> 5;
-    CUDA_CHECK(cudaMemcpy(&d_frontier_bitmap[root_word], &root_bit, sizeof(uint32_t), cudaMemcpyHostToDevice));
+    // Set bit for root in 64-bit frontier bitmap
+    uint64_t root_bit_64 = 1ULL << (root & 63);
+    uint64_t root_word_64 = root >> 6;
+    CUDA_CHECK(cudaMemcpy(&d_frontier_bitmap[root_word_64], &root_bit_64, sizeof(uint64_t), cudaMemcpyHostToDevice));
 
     // Timers & State variables
     cudaEvent_t start_event, stop_event, level_start, level_stop;
@@ -322,23 +369,36 @@ static BFSStats run_beamer_bfs_gpu_internal(
             }
         }
 
-        // Reset next frontier count
+        // Reset next frontier count & bitmap
         CUDA_CHECK(cudaMemset(d_next_frontier_count, 0, sizeof(uint64_t)));
-        CUDA_CHECK(cudaMemset(d_next_frontier_bitmap, 0, bitmap_words * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(d_next_frontier_bitmap, 0, bitmap_words_64 * sizeof(uint64_t)));
 
-        // 5. Execute Kernel for Current Direction
+        // 5. Execute Optimized Kernel for Current Direction
         if (!is_bottom_up) {
-            // TOP-DOWN Expansion
-            int td_blocks = (current_frontier_size + threads - 1) / threads;
-            kernel_bfs_top_down<<<td_blocks, threads>>>(
-                d_indptr, d_indices, d_frontier, current_frontier_size,
-                current_depth, d_depth, d_next_frontier, d_next_frontier_count,
-                d_next_frontier_bitmap
-            );
+            // TOP-DOWN Expansion (Multi-Tiered Warp Dispatcher)
+            double avg_deg = (double)frontier_edges / (double)current_frontier_size;
+
+            if (avg_deg >= 32.0) {
+                // High-Degree Frontiers: Use Warp-per-Vertex Cooperative Kernel
+                int warp_blocks = (current_frontier_size * 32 + threads - 1) / threads;
+                kernel_bfs_top_down_warp<<<warp_blocks, threads>>>(
+                    d_indptr, d_indices, d_frontier, current_frontier_size,
+                    current_depth, d_depth, d_next_frontier, d_next_frontier_count,
+                    d_next_frontier_bitmap
+                );
+            } else {
+                // Low-Degree Frontiers: Use Thread-per-Vertex Kernel
+                int td_blocks = (current_frontier_size + threads - 1) / threads;
+                kernel_bfs_top_down_thread<<<td_blocks, threads>>>(
+                    d_indptr, d_indices, d_frontier, current_frontier_size,
+                    current_depth, d_depth, d_next_frontier, d_next_frontier_count,
+                    d_next_frontier_bitmap
+                );
+            }
         } else {
-            // BOTTOM-UP Expansion
+            // BOTTOM-UP Expansion (64-bit Bitmap Word Skipping)
             int bu_blocks = (N + threads - 1) / threads;
-            kernel_bfs_bottom_up<<<bu_blocks, threads>>>(
+            kernel_bfs_bottom_up_64<<<bu_blocks, threads>>>(
                 N, d_indptr, d_indices, d_frontier_bitmap,
                 current_depth, d_depth, d_next_frontier, d_next_frontier_count,
                 d_next_frontier_bitmap
