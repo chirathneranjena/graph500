@@ -9,6 +9,7 @@
 *.out
 cpp_cuda/kronecker_cuda
 cpp_cuda/bfs_beamer
+cpp_cuda/sssp_delta
 
 # Binary Graph Dumps & Large Data Files
 *.bin

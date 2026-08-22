@@ -59,6 +59,19 @@ Executes high-performance **Delta-Stepping Single-Source Shortest Path (SSSP)** 
 
 ---
 
+## 4. Binary CSR Adjacency Matrix Visualizer (`plot_adjacency.py`)
+
+A Python script to read and plot high-resolution adjacency matrices from Graph500 binary CSR dumps (`.bin`).
+
+### Key Visualizer Capabilities
+- **Binary Header Reader**: Reads Graph500 `.bin` files (`CSRBinaryHeader`) and extracts $N$, $M$, and weight data.
+- **Adaptive Matrix Rendering**:
+  - Small Graphs ($N \le 256$): Renders full dense weight matrix with a colorbar (`viridis`).
+  - Large Graphs ($N > 256$): Renders non-zero entries using `matplotlib.pyplot.spy` for crisp visual sparsity and high-contrast structural visibility (`--markersize` and `--color` customizable).
+- **Graph Statistics (`--stats`)**: Option to print vertex counts, edge counts, density, degree distribution, and weight stats.
+
+---
+
 ## Compilation
 
 Build `kronecker_cuda`, `bfs_beamer`, and `sssp_delta` using `nvcc` and `make`:
@@ -76,22 +89,28 @@ make clean && make -j$(nproc)
 ./kronecker_cuda --scale 26 --edge-factor 16 -o graph_s26.bin
 ```
 
-### 2. Run Single GPU Beamer BFS
+### 2. Plot Adjacency Matrix & Display Graph Statistics
+```bash
+./plot_adjacency.py -i graph_s20.bin -o adjacency_matrix.png --stats
+```
+
+### 3. Run Single GPU Beamer BFS
 ```bash
 ./bfs_beamer --input graph_s20.bin --stats
 ```
 
-### 3. Run Official Graph500 64-Search BFS Benchmark
+### 4. Run Official Graph500 64-Search BFS Benchmark
 ```bash
 ./bfs_beamer --input graph_s20.bin --graph500 --stats
 ```
 
-### 4. Run Single GPU Delta-Stepping SSSP
+### 5. Run Single GPU Delta-Stepping SSSP
 ```bash
 ./sssp_delta --input graph_s20.bin --delta 0.1 --stats
 ```
 
-### 5. Run Official Graph500 64-Search SSSP Benchmark
+### 6. Run Official Graph500 64-Search SSSP Benchmark
 ```bash
 ./sssp_delta --input graph_s20.bin --graph500 --stats
 ```
+
